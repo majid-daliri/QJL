@@ -20,6 +20,34 @@ from qjl_kernel.matmul import cuda_quantized_bmm_dynamic
 
 from models.llama2_utils_qjl import QJLSketch, QJLKeyQuantizer
 
+from transformers import DynamicCache
+from transformers.modeling_flash_attention_utils import _flash_attention_forward
+
+
+class QJLCache(DynamicCache):
+    def __init__(self, num_hidden_layers: int) -> None:
+        super().__init__()
+        self._seen_tokens = 0  # Used in `generate` to keep tally of how many tokens the cache has seen
+        self.cache: [Tuple[torch.Tensor]] = [None] * num_hidden_layers
+
+    def __getitem__(self, layer_idx: int) -> List[Tuple[torch.Tensor]]:
+        return (self.cache[layer_idx])
+
+    def update(self, key_value: [Tuple[torch.Tensor]], layer_idx: int):
+        if self.cache is None:
+            self.cache = [key_value]
+        else:
+            if len(self.cache) < layer_idx:
+                self.cache.append(key_value)
+            else:
+                self.cache[layer_idx] = key_value
+
+    def get_seq_length(self):
+        if self.cache[0] is not None:
+            return self.cache[0][-1]
+        else:
+            return 0
+
 
 class LlamaAttention_QJL(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -49,7 +77,7 @@ class LlamaAttention_QJL(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
 
         self.initial_layers_count = config.initial_layers_count
-        
+
         self.qjl = config.qjl
         self.key_quantization_bits = config.key_quantization_bits
 
@@ -141,8 +169,11 @@ class LlamaAttention_QJL(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[-1]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
         assert self.num_key_value_groups == 1
         if past_key_value is not None:
             kv_quant = past_key_value[0]
@@ -206,12 +237,12 @@ class LlamaAttention_QJL(nn.Module):
                 )
 
             attn_output = attn_output.transpose(1, 2).contiguous()
-            past_key_value = (
-                kv_quant, value_states_quant, value_states_full, value_scale, value_mn,
-                kv_seq_len) if use_cache else None
+            if use_cache:
+                past_key_value = (
+                    kv_quant, value_states_quant, value_states_full, value_scale, value_mn,
+                    kv_seq_len)
 
-
-        else:                
+        else:
             input_dtype = query_states.dtype
             if input_dtype == torch.float32:
                 if hasattr(self.config, "_pre_quantization_dtype"):
@@ -229,9 +260,9 @@ class LlamaAttention_QJL(nn.Module):
                 key_states = key_states.to(target_dtype)
                 value_states = value_states.to(target_dtype)
 
-            attn_output = self._flash_attention_forward(
+            attn_output = _flash_attention_forward(
                 query_states.transpose(1, 2), key_states.transpose(1, 2),
-                value_states.transpose(1, 2), None, q_len, dropout=0.0
+                value_states.transpose(1, 2), None, q_len, dropout=0.0, is_causal=self.is_causal,
             )
             kv_quant = QJLKeyQuantizer(self.qjl, self.outlier_count_general, self.buffer_size, self.group_size,
                                        self.key_quantization_bits)
@@ -252,10 +283,10 @@ class LlamaAttention_QJL(nn.Module):
                 value_states_quant, value_scale, value_mn = triton_quantize_and_pack_along_last_dim(value_states_quant,
                                                                                                     self.group_size,
                                                                                                     self.value_quantization_bits)
-
-            past_key_value = (
-                kv_quant, value_states_quant, value_states_full, value_scale, value_mn,
-                kv_seq_len) if use_cache else None
+            if use_cache:
+                past_key_value = (
+                    kv_quant, value_states_quant, value_states_full, value_scale, value_mn,
+                    kv_seq_len)
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
 
@@ -278,57 +309,6 @@ class LlamaAttention_QJL(nn.Module):
         bit_diff_ratio = torch.sum(bit_diff, dim=-1) / self.simhash_dim
         cos_qk = torch.cos(bit_diff_ratio * torch.pi)
         return torch.einsum('bhq,bhk,bhqk->bhqk', query_norm_state, key_norm_states, cos_qk)
-
-    def _flash_attention_forward(self, query_states, key_states, value_states, attention_mask, query_length,
-                                 dropout=0.0, softmax_scale=None):
-        """
-        Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
-        first unpad the input, then computes the attention scores and pad the final attention scores.
-
-        Args:
-            query_states (`torch.Tensor`):
-                Input query states to be passed to Flash Attention API
-            key_states (`torch.Tensor`):
-                Input key states to be passed to Flash Attention API
-            value_states (`torch.Tensor`):
-                Input value states to be passed to Flash Attention API
-            attention_mask (`torch.Tensor`):
-                The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
-                position of padding tokens and 1 for the position of non-padding tokens.
-            dropout (`int`, *optional*):
-                Attention dropout
-            softmax_scale (`float`, *optional*):
-                The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
-        """
-        if attention_mask is not None:
-            batch_size = query_states.shape[0]
-            query_states, key_states, value_states, indices_q, cu_seq_lens, max_seq_lens = self._upad_input(
-                query_states, key_states, value_states, attention_mask, query_length
-            )
-
-            cu_seqlens_q, cu_seqlens_k = cu_seq_lens
-            max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
-
-            attn_output_unpad = flash_attn_varlen_func(
-                query_states,
-                key_states,
-                value_states,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_in_batch_q,
-                max_seqlen_k=max_seqlen_in_batch_k,
-                dropout_p=dropout,
-                softmax_scale=softmax_scale,
-                causal=self.is_causal,
-            )
-
-            attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
-        else:
-            attn_output = flash_attn_func(
-                query_states, key_states, value_states, dropout, softmax_scale=softmax_scale, causal=self.is_causal
-            )
-
-        return attn_output
 
     def _upad_input(self, query_layer, key_layer, value_layer, attention_mask, query_length):
         indices_k, cu_seqlens_k, max_seqlen_in_batch_k = _get_unpad_data(attention_mask)
@@ -473,7 +453,7 @@ class LlamaModel_QJL(LlamaPreTrainedModel):
             input_ids: torch.LongTensor = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            past_key_values: Optional[QJLCache] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             use_cache: Optional[bool] = None,
             output_attentions: Optional[bool] = None,
@@ -497,9 +477,9 @@ class LlamaModel_QJL(LlamaPreTrainedModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        past_key_values_length = 0
-        if past_key_values is not None:
-            past_key_values_length = past_key_values[0][-1]
+        if past_key_values is None or not isinstance(past_key_values, QJLCache):
+            past_key_values = QJLCache(len(self.layers))
+        past_key_values_length = past_key_values.get_seq_length()
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -560,7 +540,8 @@ class LlamaModel_QJL(LlamaPreTrainedModel):
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+                # next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
+                past_key_values.update(layer_outputs[2 if output_attentions else 1], idx)
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -569,7 +550,7 @@ class LlamaModel_QJL(LlamaPreTrainedModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        next_cache = next_decoder_cache if use_cache else None
+        next_cache = past_key_values if use_cache else None
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
         return BaseModelOutputWithPast(
@@ -616,7 +597,7 @@ class LlamaForCausalLM_QJL(LlamaPreTrainedModel):
             input_ids: torch.LongTensor = None,
             attention_mask: Optional[torch.Tensor] = None,
             position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            past_key_values: Optional[QJLCache] = None,
             inputs_embeds: Optional[torch.FloatTensor] = None,
             labels: Optional[torch.LongTensor] = None,
             use_cache: Optional[bool] = None,
@@ -699,22 +680,26 @@ class LlamaForCausalLM_QJL(LlamaPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-            self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+            self,
+            input_ids,
+            past_key_values,
+            attention_mask=None,
+            inputs_embeds=None,
+            **kwargs
     ):
         if past_key_values is not None:
-            past_length = past_key_values[0][-1]
+            past_length = past_key_values.get_seq_length()
             if input_ids.shape[1] > past_length:
                 remove_prefix_length = past_length
             else:
                 remove_prefix_length = input_ids.shape[1] - 1
 
             input_ids = input_ids[:, remove_prefix_length:]
-
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
-            if past_key_values:
+            if past_key_values is not None:
                 position_ids = position_ids[:, -input_ids.shape[1]:]
 
         if inputs_embeds is not None and past_key_values is None:
