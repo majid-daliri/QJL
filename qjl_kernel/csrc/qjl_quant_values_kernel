@@ -73,71 +73,36 @@ __global__ void quantize_with_outliers_kernel(
     int base_index_rand_prj = (pIdx * emb_dim);
     const Tproj* sketch = rand_prj + base_index_rand_prj;
 
-    __shared__ float shared_keys[EMB_DIM][WARP_SIZE];
+    __shared__ float shared_values[EMB_DIM][WARP_SIZE];
 #pragma unroll
     for (size_t grp_tile{wIdx}; grp_tile < WARP_SIZE; grp_tile += WARPS_PER_BLOCK) {
 #pragma unroll
         for (size_t chnl_tile{threadLane}; chnl_tile < EMB_DIM; chnl_tile += WARP_SIZE){
-            shared_keys[chnl_tile][grp_tile] = convert_to_float<T>(key[grp_tile*EMB_DIM + chnl_tile]);
+            shared_values[chnl_tile][grp_tile] = convert_to_float<T>(value[grp_tile*EMB_DIM + chnl_tile]);
         }
     }
     __syncthreads();
 
-    float sketched_keys = 0.0;
-    float sketched_outliers = 0.0;
+    float sketched_values = 0.0;
 #pragma unroll
     for (size_t chnl_idx{0}; chnl_idx < EMB_DIM; chnl_idx++){
-        float key_proj_prod = convert_to_float<Tproj>(sketch[chnl_idx]) * shared_keys[chnl_idx][threadLane];
-        if (shared_mask[chnl_idx] == 0){
-            sketched_keys += key_proj_prod;
-        }
-        else{
-            sketched_outliers += key_proj_prod;
-        }
-    }
-
-    __shared__ float shared_outlier_norms[WARP_SIZE];
-    if (blockIdx.z == 0) {
-        if (wIdx == 0){
-            shared_outlier_norms[threadLane] = 0.0;
-        }
-        __syncthreads();
-
-#pragma unroll
-        for (size_t chnl_idx{wIdx}; chnl_idx < EMB_DIM; chnl_idx += WARPS_PER_BLOCK) {
-            if (shared_mask[chnl_idx] != 0) {
-                atomicAdd(&shared_outlier_norms[threadLane], pow(shared_keys[chnl_idx][threadLane], 2));
-            }
-        }
+        sketched_vaues += convert_to_float<Tproj>(sketch[chnl_idx]) * shared_values[chnl_idx][threadLane];
     }
     __syncthreads();
 
-    __shared__ uint8_t shared_key_quant[WARP_SIZE][WARPS_PER_BLOCK];
-    __shared__ uint8_t shared_key_outlier_quant[WARP_SIZE][WARPS_PER_BLOCK];
-    shared_key_quant[threadLane][wIdx] = (sketched_keys>0 ? (1<<(wIdx%8)) :0);
-    shared_key_outlier_quant[threadLane][wIdx] = (sketched_outliers>0 ? (1<<(wIdx%8)) :0);
+    __shared__ uint8_t shared_value_quant[WARP_SIZE][WARPS_PER_BLOCK];
+    shared_value_quant[threadLane][wIdx] = (sketched_values>0 ? (1<<(wIdx%8)) :0);
     __syncthreads();
 
-    if (gIdx+threadLane >= group_size) return;
+    if (nIdx+threadLane >= n_size) return;
 
     if ((wIdx%8) == 0) {
-        uint8_t hashed_key = 0;
+        uint8_t hashed_value = 0;
 #pragma unroll
         for (int shift = 0; shift < 8; shift ++){
-            hashed_key += shared_key_quant[threadLane][wIdx+shift];
+            hashed_value += shared_value_quant[threadLane][wIdx+shift];
         }
-        key_quant[base_index_key_quant+pIdx/8] = hashed_key;
-
-        if (pIdx >= outlier_sketch_dim) return;
-
-        uint8_t hashed_outlier = 0;
-#pragma unroll
-        for (int shift = 0; shift < 8; shift ++){
-            hashed_outlier += shared_key_outlier_quant[threadLane][wIdx+shift];
-        }
-        key_outlier_quant[base_index_outlier_quant+pIdx/8] = hashed_outlier;
-    } else if ((wIdx == 1) && (blockIdx.z == 0)){
-        key_outlier_norm[threadLane] = convert_from_float<T>(sqrtf(shared_outlier_norms[threadLane]));
+        value_quant[base_index_value_quant+pIdx/8] = hashed_value;
     }
     return;
 }
