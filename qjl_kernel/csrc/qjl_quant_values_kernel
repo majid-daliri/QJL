@@ -52,51 +52,26 @@ __device__ at::BFloat16 convert_from_float<at::BFloat16>(float value) {
 
 template<typename T, typename Tproj>
 __global__ void quantize_with_outliers_kernel(
-    T* key_states,
-    uint8_t* key_quant,
-    uint8_t* key_outlier_quant,
-    const uint8_t* outlier_indices,
+    T* value_states,
+    uint8_t* value_quant,
     const Tproj* rand_prj,
-    T* outlier_norms,
-    int batch_size, int head_size, int n_size, int group_size, int sketch_dim, int outlier_sketch_dim, int emb_dim,
-    int outlier_counts) {
+    int batch_size, int head_size, int n_size, int sketch_dim, int emb_dim) {
 
-    size_t bhn = blockIdx.x;
+    size_t bh = blockIdx.x;
     size_t threadLane = threadIdx.x;
     size_t wIdx = threadIdx.y;
-    size_t gIdx = blockIdx.y * WARP_SIZE;
+    size_t nIdx = blockIdx.y * WARP_SIZE;
     size_t pIdx = blockIdx.z * WARPS_PER_BLOCK + wIdx;
 
     int hash_dim = sketch_dim/8;
-    int outlier_hash_dim = outlier_sketch_dim/8;
 
-    int base_index_key_quant = (bhn * group_size * hash_dim) + ((gIdx+threadLane) * hash_dim);
-    int base_index_outlier_quant = (bhn * group_size * outlier_hash_dim) + ((gIdx+threadLane) * outlier_hash_dim);
+    int base_index_value_quant = (bh * n_size * hash_dim) + ((nIdx+threadLane) * hash_dim);
 
-    int base_index_outlier_indices = bhn * outlier_counts;
-    const uint8_t* outlier_ind = outlier_indices + base_index_outlier_indices;
-
-    int base_index_key = (bhn * group_size * emb_dim) + (gIdx * emb_dim);
-    T* key = key_states + base_index_key;
+    int base_index_value = (bh * n_size * emb_dim) + (nIdx * emb_dim);
+    T* value = value_states + base_index_value;
 
     int base_index_rand_prj = (pIdx * emb_dim);
     const Tproj* sketch = rand_prj + base_index_rand_prj;
-
-    int base_index_outlier_norm = (bhn * group_size) + gIdx;
-    T* key_outlier_norm = outlier_norms + base_index_outlier_norm;
-
-    __shared__ uint8_t shared_mask[EMB_DIM];
-    size_t tIdx = wIdx * WARP_SIZE + threadLane;
-#pragma unroll
-    for (size_t tile_idx{tIdx}; tile_idx < EMB_DIM; tile_idx += (WARP_SIZE * WARPS_PER_BLOCK)) {
-        shared_mask[tile_idx] = 0;
-    }
-    __syncthreads();
-    if (tIdx < outlier_counts){
-        size_t otlr_idx = outlier_ind[tIdx];
-        shared_mask[otlr_idx] = 1;
-    }
-    __syncthreads();
 
     __shared__ float shared_keys[EMB_DIM][WARP_SIZE];
 #pragma unroll
